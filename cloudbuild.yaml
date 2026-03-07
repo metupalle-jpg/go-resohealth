@@ -4,71 +4,16 @@ steps:
     args:
       - -c
       - |
-        echo "Starting MyData Cloud Functions deployment..."
+        echo "Build started successfully!"
         echo "Working directory: $(pwd)"
         ls -la
         echo "---"
-        ls -la cloud-functions/ 2>&1 || echo "No cloud-functions dir"
+        ls -la cloud-functions/ || echo "No cloud-functions dir"
         echo "---"
-        
-        echo "=== Deploying process-upload ==="
-        gcloud functions deploy process-upload \
-          --project=dave-487819 \
-          --region=me-central1 \
-          --gen2 \
-          --runtime=python312 \
-          --memory=1Gi \
-          --timeout=300s \
-          --entry-point=process_upload \
-          --trigger-topic=mydata-upload-notify \
-          --service-account=mydata-pipeline@dave-487819.iam.gserviceaccount.com \
-          --set-env-vars="GCP_PROJECT=dave-487819,DOCAI_LOCATION=us,DOCAI_PROCESSOR_ID=PLACEHOLDER,PROCESSED_BUCKET=resohealth-mydata-processed,OCR_COMPLETE_TOPIC=mydata-ocr-complete,MAX_FILE_SIZE_MB=20" \
-          --max-instances=10 \
-          --min-instances=0 \
-          --source=cloud-functions/process-upload \
-          --quiet 2>&1
-        
-        echo ""
-        echo "=== Deploying classify-document ==="
-        gcloud functions deploy classify-document \
-          --project=dave-487819 \
-          --region=me-central1 \
-          --gen2 \
-          --runtime=python312 \
-          --memory=512Mi \
-          --timeout=300s \
-          --entry-point=classify_document \
-          --trigger-topic=mydata-ocr-complete \
-          --service-account=mydata-pipeline@dave-487819.iam.gserviceaccount.com \
-          --set-env-vars="GCP_PROJECT=dave-487819,VERTEX_LOCATION=us-central1,PROCESSED_BUCKET=resohealth-mydata-processed,CLASSIFIED_TOPIC=mydata-classified,MODEL_ID=gemini-2.0-flash" \
-          --max-instances=10 \
-          --min-instances=0 \
-          --source=cloud-functions/classify-document \
-          --quiet 2>&1
-        
-        echo ""
-        echo "=== Deploying store-fhir ==="
-        gcloud functions deploy store-fhir \
-          --project=dave-487819 \
-          --region=me-central1 \
-          --gen2 \
-          --runtime=python312 \
-          --memory=512Mi \
-          --timeout=300s \
-          --entry-point=store_fhir \
-          --trigger-topic=mydata-classified \
-          --service-account=mydata-pipeline@dave-487819.iam.gserviceaccount.com \
-          --set-env-vars="GCP_PROJECT=dave-487819,HEALTHCARE_LOCATION=us-central1,HEALTHCARE_DATASET=resohealth-mydata,FHIR_STORE=health-vault,PROCESSED_BUCKET=resohealth-mydata-processed,UPLOADS_BUCKET=resohealth-mydata-uploads" \
-          --max-instances=10 \
-          --min-instances=0 \
-          --source=cloud-functions/store-fhir \
-          --quiet 2>&1
-        
-        echo ""
-        echo "=== Verification ==="
-        gcloud functions list --project=dave-487819 --region=me-central1 --format="table(name,state)" 2>&1
-        echo "=== DONE ==="
-
-timeout: 1800s
+        gcloud config list
+        echo "---"
+        gcloud functions list --project=dave-487819 --region=me-central1 --limit=3 2>&1
+        echo "Build test complete!"
+timeout: 300s
 options:
   logging: CLOUD_LOGGING_ONLY
