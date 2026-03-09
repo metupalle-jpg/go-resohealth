@@ -364,7 +364,21 @@ def list_documents(user_id: str, share_token: Optional[str] = None) -> Tuple[Res
 
     # Pagination: fetch limit+1 to check for next page, offset by (page-1)*limit
     offset = (page - 1) * limit
-    docs = list(query.offset(offset).limit(limit + 1).stream())
+    try:
+        docs = list(query.offset(offset).limit(limit + 1).stream())
+    except Exception as query_exc:
+        logger.warning("Documents query failed (index may be missing): %s", query_exc)
+        # Fallback: fetch without ordering
+        try:
+            fallback_query = (
+                firestore_client.collection("users")
+                .document(effective_user_id)
+                .collection("health_documents")
+                .limit(limit + 1)
+            )
+            docs = list(fallback_query.offset(offset).stream())
+        except Exception:
+            docs = []
 
     has_next = len(docs) > limit
     docs = docs[:limit]
@@ -704,16 +718,20 @@ def get_insights(user_id: str, share_token: Optional[str] = None) -> Tuple[Respo
         effective_user_id = share_data["userId"]
 
     # Fetch all classified documents
-    docs_query = (
-        firestore_client.collection("users")
-        .document(effective_user_id)
-        .collection("health_documents")
-        .where("status", "==", "classified")
-        .order_by("uploadedAt", direction=firestore.Query.DESCENDING)
-        .limit(100)
-    )
+    try:
+        docs_query = (
+            firestore_client.collection("users")
+            .document(effective_user_id)
+            .collection("health_documents")
+            .where("status", "==", "classified")
+            .order_by("uploadedAt", direction=firestore.Query.DESCENDING)
+            .limit(100)
+        )
+        docs = list(docs_query.stream())
+    except Exception as query_exc:
+        logger.warning("Insights query failed (index may be missing): %s", query_exc)
+        docs = []
 
-    docs = list(docs_query.stream())
     if not docs:
         return jsonify({
             "insights": [],
