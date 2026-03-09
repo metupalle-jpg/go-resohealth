@@ -6,6 +6,7 @@ google-cloud-pubsub==2.*
 google-cloud-aiplatform==1.*
 google-api-python-client==2.*
 google-auth==2.*
+requests>=2.28
 vertexai
 reportlab==4.*
 PyPDF2==3.*

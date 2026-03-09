@@ -15,7 +15,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import vertexai
 from flask import Flask, Response, jsonify, request
-from google.auth import default as google_auth_default
+import google.auth
+import google.auth.transport.requests
+from google.auth import compute_engine, default as google_auth_default
 from google.cloud import firestore, storage
 from google.cloud.storage import transfer_manager
 from googleapiclient import discovery
@@ -61,6 +63,25 @@ firestore_client = firestore.Client(project=PROJECT_ID)
 
 credentials, _ = google_auth_default()
 healthcare_service = discovery.build("healthcare", "v1", credentials=credentials, cache_discovery=False)
+
+# Resolve signing credentials at startup for signed URL generation on Cloud Run.
+# Cloud Run uses metadata-based credentials, so we must use IAM signBlob API.
+def _resolve_sa_email() -> str:
+    """Return the service-account email that this Cloud Run revision runs as."""
+    import requests as _req
+    try:
+        r = _req.get(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"}, timeout=3,
+        )
+        return r.text.strip()
+    except Exception:
+        return os.environ.get("SERVICE_ACCOUNT_EMAIL",
+                              f"mydata-pipeline@{PROJECT_ID}.iam.gserviceaccount.com")
+
+_SERVICE_ACCOUNT_EMAIL: str = _resolve_sa_email()
+logger_init = logging.getLogger("mydata-api.init")
+logger_init.info("Signing SA: %s", _SERVICE_ACCOUNT_EMAIL)
 
 vertexai.init(project=PROJECT_ID, location=VERTEX_LOCATION)
 
@@ -227,18 +248,27 @@ def upload_request(user_id: str, share_token: Optional[str] = None) -> Tuple[Res
     })
 
     # Generate signed URL for upload
+    # On Cloud Run we must use IAM signBlob (no JSON key file).
+    # Requires the SA to have 'iam.serviceAccountTokenCreator' on itself.
     bucket = storage_client.bucket(UPLOADS_BUCKET)
     blob = bucket.blob(gcs_path)
 
-    signed_url = blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(minutes=30),
-        method="PUT",
-        content_type=content_type,
-        headers={
-            "x-goog-content-length-range": f"0,{max_size}",
-        },
-    )
+    try:
+        # Refresh credentials to get a valid access token
+        auth_request = google.auth.transport.requests.Request()
+        credentials.refresh(auth_request)
+
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=30),
+            method="PUT",
+            content_type=content_type,
+            service_account_email=_SERVICE_ACCOUNT_EMAIL,
+            access_token=credentials.token,
+        )
+    except Exception as sign_exc:
+        logger.exception("Signed URL generation failed for SA=%s", _SERVICE_ACCOUNT_EMAIL)
+        return jsonify({"error": f"Failed to generate upload URL: {sign_exc}"}), 500
 
     logger.info("Generated upload URL for user=%s, doc=%s", user_id, document_id)
 
@@ -246,8 +276,36 @@ def upload_request(user_id: str, share_token: Optional[str] = None) -> Tuple[Res
         "uploadUrl": signed_url,
         "documentId": document_id,
         "gcsPath": f"gs://{UPLOADS_BUCKET}/{gcs_path}",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
     }), 200
 
+
+# ---------------------------------------------------------------------------
+# 3.2b POST /api/mydata/upload/<document_id>/confirm
+# ---------------------------------------------------------------------------
+@app.route("/api/mydata/upload/<document_id>/confirm", methods=["POST"])
+@require_auth
+def confirm_upload(
+    document_id: str, user_id: str, share_token: Optional[str] = None
+) -> Tuple[Response, int]:
+    """Confirm that a file has been uploaded to GCS, triggering processing."""
+    if share_token:
+        return jsonify({"error": "Not allowed via share token"}), 403
+
+    doc_ref = (
+        firestore_client.collection("users")
+        .document(user_id)
+        .collection("health_documents")
+        .document(document_id)
+    )
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Document not found"}), 404
+
+    doc_ref.update({"status": "uploaded", "updatedAt": firestore.SERVER_TIMESTAMP})
+    logger.info("Upload confirmed for user=%s, doc=%s", user_id, document_id)
+
+    return jsonify({"status": "confirmed", "documentId": document_id}), 200
 
 # ---------------------------------------------------------------------------
 # 3.3 GET /api/mydata/documents
@@ -314,6 +372,8 @@ def list_documents(user_id: str, share_token: Optional[str] = None) -> Tuple[Res
     documents = []
     for doc in docs:
         doc_data = doc.to_dict()
+        # Ensure 'id' field is present (frontend expects it)
+        doc_data["id"] = doc_data.get("documentId", doc.id)
 
         # Apply date filters client-side
         if date_from:
@@ -335,9 +395,21 @@ def list_documents(user_id: str, share_token: Optional[str] = None) -> Tuple[Res
             doc_data.pop("ocrOutputPath", None)
             doc_data.pop("classificationPath", None)
 
+        # Serialize Firestore timestamps to ISO strings for JSON
+        for ts_field in ("uploadedAt", "updatedAt"):
+            val = doc_data.get(ts_field)
+            if val and hasattr(val, "isoformat"):
+                doc_data[ts_field] = val.isoformat()
+
         documents.append(doc_data)
 
     return jsonify({
+        "items": documents,
+        "total": len(documents) + (1 if has_next else 0),  # approximate
+        "page": page,
+        "pageSize": limit,
+        "hasMore": has_next,
+        # Legacy fields for backward compatibility
         "documents": documents,
         "pagination": {
             "page": page,
@@ -376,6 +448,13 @@ def get_document(
         return jsonify({"error": "Document not found"}), 404
 
     doc_data = doc.to_dict()
+    doc_data["id"] = doc_data.get("documentId", doc.id)
+
+    # Serialize Firestore timestamps
+    for ts_field in ("uploadedAt", "updatedAt"):
+        val = doc_data.get(ts_field)
+        if val and hasattr(val, "isoformat"):
+            doc_data[ts_field] = val.isoformat()
 
     # Optionally fetch OCR text
     include_ocr = request.args.get("includeOcr", "false").lower() == "true"
