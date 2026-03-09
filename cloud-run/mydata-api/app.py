@@ -104,7 +104,7 @@ def add_cors_headers(response: Response) -> Response:
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-User-Id, X-Share-Token"
     response.headers["Access-Control-Max-Age"] = "3600"
     return response
 
