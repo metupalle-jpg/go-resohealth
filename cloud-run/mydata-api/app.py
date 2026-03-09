@@ -401,6 +401,32 @@ def list_documents(user_id: str, share_token: Optional[str] = None) -> Tuple[Res
             if val and hasattr(val, "isoformat"):
                 doc_data[ts_field] = val.isoformat()
 
+        # ── Ensure all frontend-expected fields have safe defaults ──
+        # Map backend field names to frontend expected names
+        if "filename" in doc_data and "fileName" not in doc_data:
+            doc_data["fileName"] = doc_data["filename"]
+        if "contentType" in doc_data and "mimeType" not in doc_data:
+            doc_data["mimeType"] = doc_data["contentType"]
+        if "sizeBytes" in doc_data and "fileSizeBytes" not in doc_data:
+            doc_data["fileSizeBytes"] = doc_data["sizeBytes"]
+        if "gcsPath" in doc_data and "gcsRawPath" not in doc_data:
+            doc_data["gcsRawPath"] = doc_data["gcsPath"]
+        # Remap status: backend uses 'uploaded'/'pending', frontend expects
+        # 'pending'/'uploading'/'ocr_processing'/'classifying'/'classified'/'error'
+        status_val = doc_data.get("status", "pending")
+        if status_val == "uploaded":
+            status_val = "ocr_processing"
+        doc_data["status"] = status_val
+        # Set safe defaults for fields the frontend accesses
+        doc_data.setdefault("category", "Lab Results")
+        doc_data.setdefault("subcategories", [])
+        doc_data.setdefault("summary", "")
+        doc_data.setdefault("keyFindings", [])
+        doc_data.setdefault("dateOfService", None)
+        doc_data.setdefault("providerName", None)
+        doc_data.setdefault("fhirResourceIds", [])
+        doc_data.setdefault("aiClassification", None)
+
         documents.append(doc_data)
 
     return jsonify({
@@ -484,6 +510,28 @@ def get_document(
                 doc_data["classificationDetail"] = cls_data
         except Exception as exc:
             logger.warning("Failed to fetch classification data: %s", exc)
+
+    # ── Ensure all frontend-expected fields have safe defaults ──
+    if "filename" in doc_data and "fileName" not in doc_data:
+        doc_data["fileName"] = doc_data["filename"]
+    if "contentType" in doc_data and "mimeType" not in doc_data:
+        doc_data["mimeType"] = doc_data["contentType"]
+    if "sizeBytes" in doc_data and "fileSizeBytes" not in doc_data:
+        doc_data["fileSizeBytes"] = doc_data["sizeBytes"]
+    if "gcsPath" in doc_data and "gcsRawPath" not in doc_data:
+        doc_data["gcsRawPath"] = doc_data["gcsPath"]
+    status_val = doc_data.get("status", "pending")
+    if status_val == "uploaded":
+        status_val = "ocr_processing"
+    doc_data["status"] = status_val
+    doc_data.setdefault("category", "Lab Results")
+    doc_data.setdefault("subcategories", [])
+    doc_data.setdefault("summary", "")
+    doc_data.setdefault("keyFindings", [])
+    doc_data.setdefault("dateOfService", None)
+    doc_data.setdefault("providerName", None)
+    doc_data.setdefault("fhirResourceIds", [])
+    doc_data.setdefault("aiClassification", None)
 
     return jsonify(doc_data), 200
 
