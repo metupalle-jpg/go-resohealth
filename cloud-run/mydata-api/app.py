@@ -1709,6 +1709,32 @@ def get_appointment(appointment_id: str) -> Tuple[Response, int]:
     return jsonify(_appointment_to_dict(apt)), 200
 
 
+@app.route("/api/appointments/<appointment_id>/calendar-update", methods=["PATCH"])
+def update_appointment_calendar(appointment_id: str) -> Tuple[Response, int]:
+    """Update the Google Meet link and Calendar event ID on an appointment."""
+    data = request.get_json(silent=True) or {}
+    doc_ref = firestore_client.collection("appointments").document(appointment_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Appointment not found"}), 404
+
+    updates: Dict[str, Any] = {"updatedAt": datetime.now(timezone.utc).isoformat()}
+    if data.get("googleMeetLink"):
+        updates["googleMeetLink"] = data["googleMeetLink"]
+    if data.get("googleCalendarEventId"):
+        updates["googleCalendarEventId"] = data["googleCalendarEventId"]
+
+    try:
+        doc_ref.update(updates)
+    except Exception as exc:
+        logger.exception("Failed to update calendar info")
+        return jsonify({"error": f"Failed to update: {exc}"}), 500
+
+    apt = doc.to_dict()
+    apt.update(updates)
+    return jsonify(_appointment_to_dict(apt)), 200
+
+
 # CORS preflight for appointment routes
 @app.route("/api/appointments/<path:path>", methods=["OPTIONS"])
 def handle_appointments_options(path: str) -> Response:
