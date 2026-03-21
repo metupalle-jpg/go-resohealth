@@ -758,6 +758,70 @@ def delete_document(
 
 
 # ---------------------------------------------------------------------------
+# 3.6b GET /api/mydata/documents/<id>/file — serve document file via signed URL
+# ---------------------------------------------------------------------------
+@app.route("/api/mydata/documents/<document_id>/file", methods=["GET"])
+@require_auth
+def get_document_file(
+    document_id: str, user_id: str, share_token: Optional[str] = None
+) -> Tuple[Response, int]:
+    """Generate a short-lived signed URL for the original document file."""
+    from flask import redirect
+
+    effective_user_id = user_id
+    if share_token:
+        share_data = _validate_share_access(share_token, document_id=document_id)
+        if not share_data:
+            return jsonify({"error": "Invalid or expired share token"}), 403
+        effective_user_id = share_data["userId"]
+
+    doc_ref = (
+        firestore_client.collection("users")
+        .document(effective_user_id)
+        .collection("health_documents")
+        .document(document_id)
+    )
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Document not found"}), 404
+
+    doc_data = doc.to_dict()
+    gcs_path = doc_data.get("gcsRawPath", "")
+    if not gcs_path:
+        return jsonify({"error": "No file associated with this document"}), 404
+
+    bucket = storage_client.bucket(UPLOADS_BUCKET)
+    blob = bucket.blob(gcs_path)
+
+    if not blob.exists():
+        return jsonify({"error": "File not found in storage"}), 404
+
+    content_type = doc_data.get("contentType", doc_data.get("mimeType", "application/octet-stream"))
+
+    # Return a signed URL (valid 15 min) so the browser can fetch the file directly
+    try:
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=15),
+            method="GET",
+            response_type=content_type,
+        )
+        # If ?redirect=true, redirect the browser directly to the signed URL
+        if request.args.get("redirect") == "true":
+            return redirect(signed_url, code=302)
+
+        return jsonify({
+            "url": signed_url,
+            "contentType": content_type,
+            "fileName": doc_data.get("fileName", doc_data.get("filename", "document")),
+            "expiresIn": 900,  # 15 minutes
+        }), 200
+    except Exception as e:
+        logger.exception("Failed to generate signed URL for doc=%s", document_id)
+        return jsonify({"error": f"Failed to generate file URL: {str(e)}"}), 500
+
+
+# ---------------------------------------------------------------------------
 # 3.7 GET /api/mydata/insights
 # ---------------------------------------------------------------------------
 @app.route("/api/mydata/insights", methods=["GET"])
