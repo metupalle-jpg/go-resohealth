@@ -1411,6 +1411,87 @@ def book_appointment() -> Tuple[Response, int]:
     end_time = _slot_end(start_time)
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # ── Create Google Calendar event with Meet link ───────────────────
+    meet_link = ""
+    calendar_event_id = ""
+    try:
+        cal_credentials, _proj = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/calendar"]
+        )
+        cal_service = discovery.build("calendar", "v3", credentials=cal_credentials)
+
+        # Build ISO datetime strings in Dubai timezone (UTC+4)
+        start_dt = f"{date_str}T{start_time}:00+04:00"
+        end_dt = f"{date_str}T{end_time}:00+04:00"
+
+        patient_name = data["patientName"]
+        patient_email = data["patientEmail"]
+        consult_type = data.get("consultationType", "2nd_opinion").replace("_", " ").title()
+
+        event_body = {
+            "summary": f"ResoHealth Consult — {patient_name}",
+            "description": (
+                f"Doctor Consultation ({consult_type})\n\n"
+                f"Patient: {patient_name}\n"
+                f"Email: {patient_email}\n"
+                f"Phone: {data.get('patientCountryCode', '')} {data['patientPhone']}\n"
+                f"Notes: {data.get('notes', 'None')}\n\n"
+                f"Doctor: Dr. Vas Metupalle\n"
+                f"Appointment ID: {appointment_id}\n\n"
+                f"This is a 30-minute consultation via Google Meet.\n"
+                f"Patient health data: https://go.resohealth.life/my-data"
+            ),
+            "start": {"dateTime": start_dt, "timeZone": "Asia/Dubai"},
+            "end": {"dateTime": end_dt, "timeZone": "Asia/Dubai"},
+            "attendees": [
+                {"email": DOCTOR_EMAIL, "displayName": "Dr. Vas Metupalle"},
+                {"email": patient_email, "displayName": patient_name},
+            ],
+            "conferenceData": {
+                "createRequest": {
+                    "requestId": appointment_id,
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                }
+            },
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "email", "minutes": 60},
+                    {"method": "popup", "minutes": 15},
+                ],
+            },
+            "guestsCanModify": False,
+            "guestsCanSeeOtherGuests": False,
+        }
+
+        created_event = (
+            cal_service.events()
+            .insert(
+                calendarId="primary",
+                body=event_body,
+                conferenceDataVersion=1,
+                sendUpdates="all",  # sends invite emails to all attendees
+            )
+            .execute()
+        )
+
+        calendar_event_id = created_event.get("id", "")
+        # Extract the Meet link from conferenceData
+        conf_data = created_event.get("conferenceData", {})
+        entry_points = conf_data.get("entryPoints", [])
+        for ep in entry_points:
+            if ep.get("entryPointType") == "video":
+                meet_link = ep.get("uri", "")
+                break
+        if not meet_link:
+            meet_link = created_event.get("hangoutLink", "")
+
+        logger.info("Calendar event created: id=%s meet=%s", calendar_event_id, meet_link)
+    except Exception as cal_exc:
+        logger.warning("Google Calendar event creation failed (non-fatal): %s", cal_exc)
+        # Non-fatal — appointment is still created, just without a real Meet link
+        meet_link = f"https://meet.google.com/lookup/{appointment_id}"
+
     appointment = {
         "id": appointment_id,
         "patientEmail": data["patientEmail"],
@@ -1424,8 +1505,8 @@ def book_appointment() -> Tuple[Response, int]:
         "startTime": start_time,
         "endTime": end_time,
         "status": "confirmed",
-        "googleMeetLink": f"https://meet.google.com/lookup/{appointment_id}",
-        "googleCalendarEventId": "",
+        "googleMeetLink": meet_link,
+        "googleCalendarEventId": calendar_event_id,
         "createdAt": now_iso,
         "updatedAt": now_iso,
         "notes": data.get("notes", ""),
@@ -1592,6 +1673,25 @@ def update_appointment_status(appointment_id: str) -> Tuple[Response, int]:
         return jsonify({"error": f"Failed to update status: {exc}"}), 500
 
     apt = doc.to_dict()
+
+    # If cancelled, try to delete the Google Calendar event
+    if new_status == "cancelled":
+        cal_event_id = apt.get("googleCalendarEventId", "")
+        if cal_event_id:
+            try:
+                cal_creds, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/calendar"]
+                )
+                cal_svc = discovery.build("calendar", "v3", credentials=cal_creds)
+                cal_svc.events().delete(
+                    calendarId="primary",
+                    eventId=cal_event_id,
+                    sendUpdates="all",
+                ).execute()
+                logger.info("Calendar event deleted: %s", cal_event_id)
+            except Exception as cal_del_exc:
+                logger.warning("Failed to delete calendar event (non-fatal): %s", cal_del_exc)
+
     apt["status"] = new_status
     apt["updatedAt"] = now_iso
     return jsonify(_appointment_to_dict(apt)), 200
