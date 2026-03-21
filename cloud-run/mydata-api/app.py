@@ -786,7 +786,7 @@ def get_document_file(
         return jsonify({"error": "Document not found"}), 404
 
     doc_data = doc.to_dict()
-    gcs_path = doc_data.get("gcsRawPath", "")
+    gcs_path = doc_data.get("gcsRawPath") or doc_data.get("gcsPath") or ""
     if not gcs_path:
         return jsonify({"error": "No file associated with this document"}), 404
 
