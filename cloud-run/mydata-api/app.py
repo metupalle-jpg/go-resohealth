@@ -790,8 +790,18 @@ def get_document_file(
     if not gcs_path:
         return jsonify({"error": "No file associated with this document"}), 404
 
-    bucket = storage_client.bucket(UPLOADS_BUCKET)
-    blob = bucket.blob(gcs_path)
+    # Strip gs://bucket-name/ prefix if present
+    if gcs_path.startswith("gs://"):
+        # gs://bucket-name/path/to/file -> path/to/file
+        parts = gcs_path.replace("gs://", "").split("/", 1)
+        bucket_name = parts[0]
+        blob_path = parts[1] if len(parts) > 1 else ""
+        bucket = storage_client.bucket(bucket_name)
+    else:
+        blob_path = gcs_path
+        bucket = storage_client.bucket(UPLOADS_BUCKET)
+
+    blob = bucket.blob(blob_path)
 
     if not blob.exists():
         return jsonify({"error": "File not found in storage"}), 404
