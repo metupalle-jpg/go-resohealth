@@ -1297,6 +1297,326 @@ def export_fhir(user_id: str, share_token: Optional[str] = None) -> Tuple[Respon
 
 
 # ---------------------------------------------------------------------------
+# Appointments
+# ---------------------------------------------------------------------------
+
+DOCTOR_EMAIL: str = "vas@1lifehealthcare.co"
+DUBAI_TZ_OFFSET: int = 4  # UTC+4
+# Clinic slots: 16:00 – 19:00 Dubai time, 30-min increments
+_SLOT_STARTS: List[str] = ["16:00", "16:30", "17:00", "17:30", "18:00", "18:30"]
+
+
+def _slot_end(start: str) -> str:
+    """Return HH:MM end time 30 minutes after start (HH:MM)."""
+    h, m = map(int, start.split(":"))
+    dt = datetime(2000, 1, 1, h, m) + timedelta(minutes=30)
+    return dt.strftime("%H:%M")
+
+
+def _now_dubai() -> datetime:
+    """Return current datetime in Dubai timezone (UTC+4) as an aware datetime."""
+    dubai_tz = timezone(timedelta(hours=DUBAI_TZ_OFFSET))
+    return datetime.now(dubai_tz)
+
+
+def _appointment_to_dict(doc_data: dict) -> dict:
+    """Serialize appointment Firestore doc to JSON-safe dict."""
+    for ts_field in ("createdAt", "updatedAt"):
+        val = doc_data.get(ts_field)
+        if val and hasattr(val, "isoformat"):
+            doc_data[ts_field] = val.isoformat()
+    return doc_data
+
+
+@app.route("/api/appointments/slots", methods=["GET"])
+def get_appointment_slots() -> Tuple[Response, int]:
+    """Return available 30-min slots for a given date (Dubai time 16:00–19:00)."""
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"error": "date query parameter is required (YYYY-MM-DD)"}), 400
+
+    # Validate date format
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+
+    # Fetch existing (non-cancelled/non-archived) appointments on this date
+    try:
+        existing_docs = (
+            firestore_client.collection("appointments")
+            .where("date", "==", date_str)
+            .stream()
+        )
+        booked_starts = set()
+        for doc in existing_docs:
+            apt = doc.to_dict()
+            if apt.get("status") not in ("cancelled", "archived"):
+                booked_starts.add(apt.get("startTime"))
+    except Exception as exc:
+        logger.exception("Failed to query appointments for date=%s", date_str)
+        return jsonify({"error": f"Failed to retrieve slots: {exc}"}), 500
+
+    slots = []
+    for start in _SLOT_STARTS:
+        slots.append({
+            "start": start,
+            "end": _slot_end(start),
+            "available": start not in booked_starts,
+        })
+
+    return jsonify({"date": date_str, "slots": slots}), 200
+
+
+@app.route("/api/appointments/book", methods=["POST"])
+def book_appointment() -> Tuple[Response, int]:
+    """Book a 30-min appointment slot."""
+    data = request.get_json(silent=True) or {}
+
+    required_fields = ["date", "startTime", "patientName", "patientEmail", "patientPhone"]
+    missing = [f for f in required_fields if not data.get(f)]
+    if missing:
+        return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+    date_str: str = data["date"]
+    start_time: str = data["startTime"]
+
+    # Validate date
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+
+    # Validate slot
+    if start_time not in _SLOT_STARTS:
+        return jsonify({"error": f"Invalid slot. Must be one of: {_SLOT_STARTS}"}), 400
+
+    # Double-check availability in Firestore (race-condition guard)
+    try:
+        conflict_docs = (
+            firestore_client.collection("appointments")
+            .where("date", "==", date_str)
+            .where("startTime", "==", start_time)
+            .stream()
+        )
+        for doc in conflict_docs:
+            apt = doc.to_dict()
+            if apt.get("status") not in ("cancelled", "archived"):
+                return jsonify({"error": "Slot is no longer available"}), 409
+    except Exception as exc:
+        logger.exception("Availability double-check failed")
+        return jsonify({"error": f"Failed to verify slot availability: {exc}"}), 500
+
+    appointment_id = str(uuid.uuid4())
+    end_time = _slot_end(start_time)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    appointment = {
+        "id": appointment_id,
+        "patientEmail": data["patientEmail"],
+        "patientName": data["patientName"],
+        "patientPhone": data["patientPhone"],
+        "patientCountryCode": data.get("patientCountryCode", ""),
+        "patientUserId": data.get("patientUserId") or None,
+        "patientVaultId": data.get("patientVaultId") or None,
+        "doctorEmail": DOCTOR_EMAIL,
+        "date": date_str,
+        "startTime": start_time,
+        "endTime": end_time,
+        "status": "confirmed",
+        "googleMeetLink": f"https://meet.google.com/lookup/{appointment_id}",
+        "googleCalendarEventId": "",
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+        "notes": data.get("notes", ""),
+        "consultationType": data.get("consultationType", "2nd_opinion"),
+    }
+
+    try:
+        firestore_client.collection("appointments").document(appointment_id).set(appointment)
+    except Exception as exc:
+        logger.exception("Failed to create appointment")
+        return jsonify({"error": f"Failed to create appointment: {exc}"}), 500
+
+    return jsonify(appointment), 201
+
+
+@app.route("/api/appointments/my", methods=["GET"])
+@require_auth
+def get_my_appointments(user_id: str, share_token: Optional[str] = None) -> Tuple[Response, int]:
+    """Return all appointments for the authenticated user, with auto status expiry."""
+    if share_token:
+        return jsonify({"error": "Not allowed via share token"}), 403
+
+    # Fetch patient email from Firestore user profile (best-effort)
+    patient_email: Optional[str] = None
+    try:
+        user_doc = firestore_client.collection("users").document(user_id).get()
+        if user_doc.exists:
+            patient_email = user_doc.to_dict().get("email")
+    except Exception:
+        pass  # Proceed without email filter if lookup fails
+
+    # Query by patientUserId
+    appointments: Dict[str, dict] = {}
+    try:
+        for doc in (
+            firestore_client.collection("appointments")
+            .where("patientUserId", "==", user_id)
+            .stream()
+        ):
+            apt = doc.to_dict()
+            appointments[doc.id] = apt
+    except Exception as exc:
+        logger.warning("patientUserId query failed: %s", exc)
+
+    # Also query by patientEmail if available
+    if patient_email:
+        try:
+            for doc in (
+                firestore_client.collection("appointments")
+                .where("patientEmail", "==", patient_email)
+                .stream()
+            ):
+                apt = doc.to_dict()
+                appointments[doc.id] = apt  # deduplicate by doc id
+        except Exception as exc:
+            logger.warning("patientEmail query failed: %s", exc)
+
+    now_dubai = _now_dubai()
+    updated_appointments: List[dict] = []
+
+    for apt in appointments.values():
+        current_status = apt.get("status", "confirmed")
+
+        # Only auto-expire/archive "confirmed" and "expired" statuses
+        if current_status in ("confirmed", "expired"):
+            try:
+                apt_date = apt.get("date", "")
+                apt_start = apt.get("startTime", "")
+                # Parse appointment start as Dubai time
+                dubai_tz = timezone(timedelta(hours=DUBAI_TZ_OFFSET))
+                apt_dt = datetime.strptime(f"{apt_date} {apt_start}", "%Y-%m-%d %H:%M").replace(
+                    tzinfo=dubai_tz
+                )
+                apt_end_30 = apt_dt + timedelta(minutes=30)
+                apt_end_60 = apt_dt + timedelta(minutes=60)
+
+                doc_ref = firestore_client.collection("appointments").document(apt["id"])
+                if current_status == "confirmed" and now_dubai > apt_end_30:
+                    new_status = "expired"
+                    doc_ref.update({"status": new_status, "updatedAt": datetime.now(timezone.utc).isoformat()})
+                    apt["status"] = new_status
+                elif current_status == "expired" and now_dubai > apt_end_60:
+                    new_status = "archived"
+                    doc_ref.update({"status": new_status, "updatedAt": datetime.now(timezone.utc).isoformat()})
+                    apt["status"] = new_status
+            except Exception as exc:
+                logger.warning("Status auto-update failed for apt %s: %s", apt.get("id"), exc)
+
+        updated_appointments.append(_appointment_to_dict(apt))
+
+    # Sort by date DESC, then startTime ASC
+    updated_appointments.sort(
+        key=lambda a: (a.get("date", ""), a.get("startTime", "")),
+        reverse=False,
+    )
+    # Re-sort: date DESC, startTime ASC requires a custom key
+    updated_appointments.sort(
+        key=lambda a: (-int(a.get("date", "2000-01-01").replace("-", "")), a.get("startTime", ""))
+    )
+
+    return jsonify({"appointments": updated_appointments}), 200
+
+
+@app.route("/api/appointments/all", methods=["GET"])
+def get_all_appointments() -> Tuple[Response, int]:
+    """Doctor endpoint: return all appointments, optionally filtered by date and/or status."""
+    doctor_email = request.args.get("doctorEmail")
+    if not doctor_email:
+        return jsonify({"error": "doctorEmail query parameter is required"}), 400
+
+    date_filter = request.args.get("date")  # optional YYYY-MM-DD
+    status_filter = request.args.get("status")  # optional comma-separated statuses
+    status_list: Optional[List[str]] = (
+        [s.strip() for s in status_filter.split(",")] if status_filter else None
+    )
+
+    try:
+        query = (
+            firestore_client.collection("appointments")
+            .where("doctorEmail", "==", doctor_email)
+        )
+        if date_filter:
+            query = query.where("date", "==", date_filter)
+
+        docs = list(query.stream())
+    except Exception as exc:
+        logger.exception("Failed to query all appointments")
+        return jsonify({"error": f"Failed to retrieve appointments: {exc}"}), 500
+
+    appointments: List[dict] = []
+    for doc in docs:
+        apt = doc.to_dict()
+        if status_list and apt.get("status") not in status_list:
+            continue
+        appointments.append(_appointment_to_dict(apt))
+
+    # Sort: date DESC, startTime ASC
+    appointments.sort(
+        key=lambda a: (-int(a.get("date", "2000-01-01").replace("-", "")), a.get("startTime", ""))
+    )
+
+    return jsonify({"appointments": appointments, "total": len(appointments)}), 200
+
+
+@app.route("/api/appointments/<appointment_id>/status", methods=["PATCH"])
+def update_appointment_status(appointment_id: str) -> Tuple[Response, int]:
+    """Update the status of an appointment."""
+    data = request.get_json(silent=True) or {}
+    new_status = data.get("status")
+    valid_statuses = ("completed", "cancelled", "archived")
+    if new_status not in valid_statuses:
+        return jsonify({"error": f"Invalid status. Must be one of: {list(valid_statuses)}"}), 400
+
+    doc_ref = firestore_client.collection("appointments").document(appointment_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Appointment not found"}), 404
+
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        doc_ref.update({"status": new_status, "updatedAt": now_iso})
+    except Exception as exc:
+        logger.exception("Failed to update appointment status")
+        return jsonify({"error": f"Failed to update status: {exc}"}), 500
+
+    apt = doc.to_dict()
+    apt["status"] = new_status
+    apt["updatedAt"] = now_iso
+    return jsonify(_appointment_to_dict(apt)), 200
+
+
+@app.route("/api/appointments/<appointment_id>", methods=["GET"])
+def get_appointment(appointment_id: str) -> Tuple[Response, int]:
+    """Return full details for a single appointment."""
+    doc_ref = firestore_client.collection("appointments").document(appointment_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Appointment not found"}), 404
+
+    apt = doc.to_dict()
+    return jsonify(_appointment_to_dict(apt)), 200
+
+
+# CORS preflight for appointment routes
+@app.route("/api/appointments/<path:path>", methods=["OPTIONS"])
+def handle_appointments_options(path: str) -> Response:
+    """Handle CORS preflight for appointment endpoints."""
+    return Response("", status=204)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
