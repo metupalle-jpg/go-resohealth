@@ -810,11 +810,18 @@ def get_document_file(
 
     # Return a signed URL (valid 15 min) so the browser can fetch the file directly
     try:
+        # On Cloud Run, default credentials are Compute Engine credentials which
+        # cannot sign directly. Use access_token + service_account_email approach.
+        auth_req = google.auth.transport.requests.Request()
+        credentials, _project = google.auth.default()
+        credentials.refresh(auth_req)
         signed_url = blob.generate_signed_url(
             version="v4",
             expiration=timedelta(minutes=15),
             method="GET",
             response_type=content_type,
+            service_account_email=credentials.service_account_email,
+            access_token=credentials.token,
         )
         # If ?redirect=true, redirect the browser directly to the signed URL
         if request.args.get("redirect") == "true":
