@@ -1,19 +1,22 @@
 steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA']
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: bash
+    entrypoint: gcloud
     args:
-      - -c
-      - |
-        echo "Build started successfully!"
-        echo "Working directory: $(pwd)"
-        ls -la
-        echo "---"
-        ls -la cloud-functions/ || echo "No cloud-functions dir"
-        echo "---"
-        gcloud config list
-        echo "---"
-        gcloud functions list --project=dave-487819 --region=me-central1 --limit=3 2>&1
-        echo "Build test complete!"
-timeout: 300s
-options:
-  logging: CLOUD_LOGGING_ONLY
+      - 'run'
+      - 'deploy'
+      - 'go-resohealth'
+      - '--image'
+      - 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA'
+      - '--region'
+      - 'me-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+images:
+  - 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA'
