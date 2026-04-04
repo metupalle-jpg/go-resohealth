@@ -1,6 +1,6 @@
 steps:
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA', '.']
+    args: ['build', '--build-arg', 'NEXT_PUBLIC_API_URL=https://go.resohealth.life', '--build-arg', 'NEXT_PUBLIC_OPENCLAW_ENABLED=true', '-t', 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA', '.']
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', 'me-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/go-resohealth:$COMMIT_SHA']
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'

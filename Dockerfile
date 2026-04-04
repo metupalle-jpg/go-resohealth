@@ -6,6 +6,10 @@ COPY src/package.json src/package-lock.json* ./
 RUN npm install
 
 FROM base AS builder
+ARG NEXT_PUBLIC_API_URL=https://go.resohealth.life
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_OPENCLAW_ENABLED=true
+ENV NEXT_PUBLIC_OPENCLAW_ENABLED=$NEXT_PUBLIC_OPENCLAW_ENABLED
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY src/ .
