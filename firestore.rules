@@ -1,0 +1,16 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // bio_age_intakes is server-only. All reads/writes must go through the
+    // Firebase Admin SDK (Cloud Run API routes). No client may read or write.
+    match /bio_age_intakes/{intakeId} {
+      allow read, write: if false;
+    }
+
+    // Members can read their own claimed bio-age reports under their user doc.
+    match /users/{uid}/bioAgeReports/{reportId} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if false; // server-only via Admin SDK
+    }
+  }
+}
